@@ -1,0 +1,462 @@
+Sub invertSigma()
+
+'Disable Screen Updating and Events for status bar application
+Application.EnableEvents = False
+Application.ScreenUpdating = False
+
+Dim tol As Double
+Dim sht As Worksheet
+Dim temp As Range
+Dim lastComp As Integer
+Dim Tickers As Range
+
+'A array must be 1 based for both dimensions, _
+ i.e. elements in the 0 index will be omited and might cause errors
+Dim A
+Dim S, X, Sd, id, AX
+Dim SVD As Collection
+Dim cond, max, min, FNorm As Double
+
+'Define constants
+tol = 1E-16
+
+'Obtain asset quantities and symbols
+Set sht = ThisWorkbook.Worksheets("Assets")
+lastComp = sht.Range("A10000").End(xlUp).Row
+If lastComp = 1 Then Exit Sub   'The first row is only headers
+Set Tickers = sht.Range("A2:A" & lastComp)
+    
+'Populate covariance matrix array
+Set sht = ThisWorkbook.Worksheets("sigma")
+Set temp = sht.Range("B2:" & sht.Cells(lastComp, lastComp).Address)
+A = temp.Value
+
+'Estimate condition number from matrix S
+Set SVD = SVDr(A, tol)
+S = SVD("S")
+Sd = DIAG(S)
+max = 0
+min = 100
+For i = 1 To lastComp - 1
+    If Abs(Sd(i)) > max Then: max = Abs(Sd(i))
+    If Abs(Sd(i)) < min Then: min = Abs(Sd(i))
+Next i
+cond = max / min
+Debug.Print "Condition number estimate = " & Format(cond, "0.00E+00")
+
+'Calculate pseudo-inverse matrix X
+X = PInv(A, tol)
+
+'A matrix multiplied by its inverse should equal the identity matrix
+AX = MultArrays(A, X)
+id = EYE(lastComp - 1)
+
+'Check closeness of AX and id with the Forbenius Norm
+FNorm = 0
+For j = 1 To lastComp - 1
+    For i = 1 To lastComp - 1
+        FNorm = FNorm + Abs(AX(i, j) - id(i, j)) ^ 2
+    Next i
+Next j
+FNorm = Sqr(FNorm)
+Debug.Print "Forbenius Norm(AX,I) = " & Format(FNorm, "0.00E+00")
+
+'Print matrix to sheet
+Set sht = ThisWorkbook.Worksheets("pinv")
+sht.Select
+sht.UsedRange.ClearContents
+For i = 1 To lastComp - 1
+    For j = 1 To lastComp - 1
+        sht.Cells(i + 1, j + 1).Value = X(i, j)
+        If j = i Then
+            sht.Cells(1, j + 1).Value = Tickers(j)
+            sht.Cells(j + 1, 1).Value = Tickers(j)
+        End If
+    Next j
+Next i
+
+
+'Enable Screen Updating and Events for status bar application
+Application.EnableEvents = True
+Application.ScreenUpdating = True
+Application.StatusBar = ""
+
+End Sub
+
+Public Function PInv(A As Variant, tol As Double) As Variant
+'Calculate the pseudoinverse of variance-covariance matrix _
+    using the Moore-Penrose method. The pseudoinverse is used _
+    to compute a best fit (least squares) solution.
+
+'This function produces a matrix X of the same dimensions _
+    as A' so that A*X*A = A, X*A*X = X and A*X and X*A _
+    are Hermitian. The computation is based on SVD(A) and any _
+    singular values less than a tolerance are treated as zero.
+    
+Dim U, S, Sd, V, X
+Dim r1 As Long
+Dim i, j
+Dim SVD As Collection
+
+'Square matrix assumed, i.e. numCols = numRows
+LB = LBound(A, 1)
+UB = UBound(A, 1)
+
+ReDim X(LB To UB, LB To UB)
+Set SVD = SVDr(A, tol)
+U = SVD("U")
+S = SVD("S")
+V = SVD("V")
+Sd = DIAG(S)
+
+'Calculate number of singular values that are greater than the tolerance
+r1 = 0
+For i = LB To UB
+    If Sd(i) > tol Then
+        r1 = r1 + 1
+    End If
+Next i
+Debug.Print "Rank(Sigma) = " & r1
+Debug.Print UB - r1 & " singular value(s) excluded."
+
+'Remove singular values from V, U matrices and Sd vector
+ReDim Preserve V(LB To UB, LB To r1)
+ReDim Preserve U(LB To UB, LB To r1)
+ReDim Preserve Sd(LB To r1)
+
+'Invert Sd vector elements
+For i = LB To r1
+    Sd(i) = 1 / Sd(i)
+Next i
+
+'Populate pseudo-inverse matrix X
+For i = LB To UB
+    For j = LB To r1
+        V(i, j) = V(i, j) * Sd(j)   'Sd row vector in this case
+    Next j
+Next i
+X = MultArrays(V, TransposeArray(U))
+
+PInv = X
+
+End Function
+Public Function SVDr(A As Variant, tol As Double) As Object
+'Singular Value Decomposition (SVD) of matrix A _
+    Returns components U, S & V such that _
+    A = USVt
+    
+Dim U, S, Sd, V, Q, R, errM, errV
+'U Orthonormal matrix
+'S Diagonal matrix
+'V Orthormal matrix
+'Q Orthonormal matrix from QR Factorisation
+'R Upper triangular matrix from QR Factorisation
+'errM Upper triangular error matrix
+'errV Error vector
+Dim QR As Collection
+Dim LB, UB, i, j, ind As Integer
+Dim loopCount, loopMax As Long
+Dim err As Double
+Dim E, F As Double
+
+'Square matrix assumed, i.e. numCols = numRows
+LB = LBound(A, 1)
+UB = UBound(A, 1)
+
+ReDim errV(LB To (UB - LB + 1) ^ 2)
+loopMax = (UB - LB + 1) * 100
+loopCount = 0
+err = 1.79E+308
+U = EYE(UB - LB + 1)
+S = TransposeArray(A)
+V = EYE(UB - LB + 1)
+
+Do While loopCount < loopMax And err > tol
+
+    Set QR = QR_GS(TransposeArray(S))
+    Q = QR("Q")
+    S = QR("R")
+    U = MultArrays(U, Q)
+
+    Set QR = QR_GS(TransposeArray(S))
+    Q = QR("Q")
+    S = QR("R")
+    V = MultArrays(V, Q)
+    
+    errM = TRIU(S, 1)
+    'Convert errM to column vector
+    For j = LB To UB
+        For i = LB To UB
+            ind = i + (j - 1) * (UB - LB + 1)
+            errV(ind) = errM(i, j)
+        Next i
+    Next j
+    E = NORM(errV)
+    F = NORM(DIAG(S))
+    If F = 0 Then: F = 1
+    err = E / F
+    
+    loopCount = loopCount + 1
+    Application.StatusBar = "SVD Iterations " & loopCount & " of " & loopMax
+Loop
+
+'Adjust signs in S matrix and remove near zero entries (i.e. entries not on diagonal)
+Sd = DIAG(S)
+S = ZEROS(UB - LB + 1)
+For j = LB To UB
+    S(j, j) = Abs(Sd(j))
+    If Sd(j) < 0 Then
+        'Adjust signs of U matrix
+        For i = LB To UB
+            U(i, j) = -U(i, j)
+        Next i
+    End If
+Next j
+
+Set SVDr = New Collection
+SVDr.add Item:=U, Key:="U"
+SVDr.add Item:=S, Key:="S"
+SVDr.add Item:=V, Key:="V"
+
+End Function
+
+Public Function QR_GS(A As Variant) As Object
+'QR Factorisation via Gram-Schmidt orthoganolisation and least squares _
+    Method modified from Timothy Sauer - Numerical Analysis 2E _
+    Assumes square matrix A _
+    [This method suffers from subtractive cancellation]
+
+Dim Q, R, Aj, Y, RijQi
+'Q Orthonormal matrix
+'R Upper triangular matrix
+'Aj Column vectors of matrix A
+'y Partial basis set
+'RijQiIntermediate dot product
+Dim i, j, k
+Dim LB As Long 'Lowerbound index of matrix A
+Dim UB As Long 'Upperbound index of matrix A
+Dim sum As Double   'Running summation
+    
+'i represents row number
+'j represents column number
+
+'Square matrix assumed, i.e. numCols = numRows
+LB = LBound(A, 1)
+UB = UBound(A, 1)
+
+ReDim Q(LB To UB, LB To UB)
+ReDim R(LB To UB, LB To UB)
+ReDim Y(LB To UB, LB To UB)
+ReDim Aj(LB To UB)
+ReDim RijQi(LB To UB)
+
+Q = ZEROS(UB - LB + 1)
+R = ZEROS(UB - LB + 1)
+
+For j = LB To UB
+    
+    For k = LB To UB
+        Aj(k) = A(k, j)
+        Y(k, j) = A(k, j)
+    Next k
+    
+    For i = LB To j - 1
+        'Rij = Qi . Aj
+        R(i, j) = 0
+        'For k = LB To UB: R(i, j) = R(i, j) + Q(k, i) * Aj(k): Next k   'Classical method
+        For k = LB To UB: R(i, j) = R(i, j) + Q(k, i) * Y(k, j): Next k 'Modified method
+        'RijQi = Rij * Qi
+        For k = LB To UB: RijQi(k) = R(i, j) * Q(k, i): Next k
+        'Yj = Yj - RijQi
+        For k = LB To UB: Y(k, j) = Y(k, j) - RijQi(k): Next k
+        
+    Next i
+    
+    R(j, j) = 0
+    For i = LB To UB: R(j, j) = R(j, j) + Y(i, j) ^ 2: Next i
+    R(j, j) = Sqr(R(j, j))
+    
+    'Qj = Yj / Rjj
+    For i = LB To UB: Q(i, j) = Y(i, j) / R(j, j): Next i
+
+Next j
+
+Set QR_GS = New Collection
+QR_GS.add Item:=Q, Key:="Q"
+QR_GS.add Item:=R, Key:="R"
+
+End Function
+
+Public Function EYE(n As Long) As Variant
+'Return nxn identity matrix
+
+If n = 0 Then
+    MsgBox ("Identity must have at least 1 element")
+    Exit Function
+End If
+
+Dim i() As Variant
+Dim j, k As Long
+
+ReDim i(1 To n, 1 To n)
+For j = 1 To n
+    For k = 1 To n
+        If j = k Then: i(j, k) = 1: Else: i(j, k) = 0
+    Next k
+Next j
+
+EYE = i
+    
+End Function
+
+Public Function ZEROS(n As Long) As Variant
+'Return nxn matrix of zeros
+
+If n = 0 Then
+    MsgBox ("Matrix must have at least 1 element")
+    Exit Function
+End If
+
+Dim Z() As Variant
+Dim j, k As Long
+
+ReDim Z(1 To n, 1 To n)
+For j = 1 To n
+    For k = 1 To n
+        Z(j, k) = 0
+    Next k
+Next j
+
+ZEROS = Z
+
+End Function
+
+Public Function NORM(yi As Variant) As Double
+'Returns the length of vector of yi
+
+Dim sum As Double   'Running summation
+Dim L As Double 'Vector length
+
+'Calculate vector length
+sum = 0
+For i = LBound(yi) To UBound(yi)
+    sum = sum + yi(i) * yi(i)
+Next i
+L = Sqr(sum)
+
+NORM = L
+
+End Function
+Public Function TRIU(A As Variant, n As Integer) As Variant
+'Returns the upper triangular part of matrix A _
+    Elements on or above the nth diagonal of A are returned _
+    where n=0 corresponds to the main diagonal
+    
+'Square matrix assumed, i.e. numCols = numRows
+Dim LB, UB As Integer
+LB = LBound(A, 1)
+UB = UBound(A, 1)
+
+Dim i, j
+Dim tri() As Double
+ReDim tri(LB To UB, LB To UB)
+
+For j = LB To UB
+    For i = LB To UB
+        If i <= j - n Then
+            tri(i, j) = A(i, j)
+        Else
+            tri(i, j) = 0
+        End If
+    Next i
+Next j
+
+
+TRIU = tri
+
+End Function
+
+Public Function DIAG(A As Variant) As Variant
+'returns a column vector of the main diagonal elements of A
+
+'Square matrix assumed, i.e. numCols = numRows
+Dim LB, UB As Integer
+LB = LBound(A, 1)
+UB = UBound(A, 1)
+
+Dim i, j
+Dim dia() As Double
+ReDim dia(LB To UB)
+
+For j = LB To UB
+    For i = LB To UB
+        If i = j Then
+            dia(j) = A(i, j)
+        End If
+    Next i
+Next j
+
+DIAG = dia
+
+End Function
+
+Public Function TransposeArray(myarray As Variant) As Variant
+'This function will transpose a 1-based variant array and manually transpose each element
+
+Dim X As Long
+Dim Y As Long
+Dim Xupper As Long
+Dim Yupper As Long
+Dim tempArray As Variant
+
+Xupper = UBound(myarray, 2)
+Yupper = UBound(myarray, 1)
+
+ReDim tempArray(1 To Xupper, 1 To Yupper)
+
+For X = 1 To Xupper
+    For Y = 1 To Yupper
+        tempArray(X, Y) = myarray(Y, X)
+    Next Y
+Next X
+
+TransposeArray = tempArray
+    
+End Function
+
+Public Function MultArrays(myarray1 As Variant, myarray2 As Variant) As Variant
+'This function will return the matrix multiplication of two 1-based, 2D arrays of compatible size
+
+Dim X As Long
+Dim Y As Long
+Dim Z As Long
+Dim X1upper, X2upper As Long
+Dim Y1upper, Y2upper As Long
+Dim tempArray As Variant
+Dim temp As Double
+
+Y1upper = UBound(myarray1, 1)   'num rows
+X1upper = UBound(myarray1, 2)   'num columns
+Y2upper = UBound(myarray2, 1)   'num rows
+X2upper = UBound(myarray2, 2)   'num columns
+
+If X1upper <> Y2upper Then
+    MsgBox ("Incompatible array sizes.")
+    Exit Function   'Incompatible matrix sizes
+End If
+
+ReDim tempArray(1 To Y1upper, 1 To X2upper)
+
+For Y = 1 To Y1upper
+    For X = 1 To X2upper
+        For Z = 1 To X1upper
+            temp = temp + myarray1(Y, Z) * myarray2(Z, X)
+        Next Z
+        tempArray(Y, X) = temp
+        temp = 0
+    Next X
+Next Y
+
+MultArrays = tempArray
+    
+End Function
